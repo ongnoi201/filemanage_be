@@ -38,7 +38,11 @@ exports.uploadFiles = async (req, res) => {
         res.status(201).json(savedFiles);
 
     } catch (error) {
-        console.log('Lỗi server khi upload file');
+        console.error('Chi tiết lỗi upload:', error); // In ra console để debug
+        res.status(500).json({ 
+            message: "Lỗi server khi upload file", 
+            error: error.message 
+        });
     }
 };
 

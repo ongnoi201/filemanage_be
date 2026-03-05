@@ -120,6 +120,7 @@ exports.loginWithFace = async (req, res) => {
             const token = generateToken(matchedUser._id);
             res.status(200).json({
                 _id: matchedUser._id,
+                fname: matchedUser.fname,
                 username: matchedUser.username,
                 token: token
             });
