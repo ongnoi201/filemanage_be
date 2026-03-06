@@ -2,6 +2,7 @@ const { chunkArray } = require('../config/utils');
 const cloudinary = require('../config/storage');
 const Folder = require('../models/Folder');
 const File = require('../models/File');
+const crypto = require('crypto');
 
 const getAllSubFolderIds = async (folderId, userId) => {
     let ids = [folderId];
@@ -14,44 +15,25 @@ const getAllSubFolderIds = async (folderId, userId) => {
     return ids;
 };
 
-const isNameDuplicate = async (userId, parentId, name, excludeId = null) => {
-    const query = {
-        userId,
-        parentId: parentId || null,
-        name: name.trim(),
-        isDeleted: false
-    };
-    if (excludeId) {
-        query._id = { $ne: excludeId };
-    }
-    const existing = await Folder.findOne(query);
-    return !!existing;
-};
-
 // Tạo thư mục mới
 exports.createFolder = async (req, res) => {
     try {
         const { name, parentId } = req.body;
         const userId = req.user._id;
-
-        // Kiểm tra trùng tên
         const existing = await Folder.findOne({
             userId,
             parentId: parentId || null,
             name: name.trim(),
             isDeleted: false
         });
-
         if (existing) {
             return res.status(400).json({ message: "Tên thư mục này đã tồn tại ở cấp hiện tại." });
         }
-
         const newFolder = new Folder({
             name: name.trim(),
             parentId: parentId || null,
             userId
         });
-
         await newFolder.save();
         res.status(201).json(newFolder);
     } catch (error) {
@@ -68,13 +50,11 @@ exports.renameFolder = async (req, res) => {
 
         const folder = await Folder.findOne({ _id: id, userId });
         if (!folder) return res.status(404).json({ message: "Không tìm thấy thư mục." });
-
-        // Kiểm tra xem tên mới có trùng với thư mục khác cùng cấp không
         const duplicate = await Folder.findOne({
             userId,
             parentId: folder.parentId,
             name: name.trim(),
-            _id: { $ne: id }, // Không kiểm tra chính nó
+            _id: { $ne: id },
             isDeleted: false
         });
 
@@ -93,13 +73,29 @@ exports.renameFolder = async (req, res) => {
 exports.getFolders = async (req, res) => {
     try {
         const parentId = req.query.parentId || null;
+        
+        // 1. Lấy dữ liệu dạng POJO (Plain Old JavaScript Object)
         const folders = await Folder.find({ 
             userId: req.user._id, 
             parentId: parentId,
             isDeleted: false 
+        }).lean();
+
+        // 2. Map qua danh sách để biến đổi imageHash thành Boolean
+        const sanitizedFolders = folders.map(folder => {
+            if (folder.protection) {
+                // Chuyển imageHash thành true nếu có dữ liệu, ngược lại là false
+                folder.protection.hasImageKey = !!folder.protection.imageHash;
+                
+                // Xóa imageHash thật để bảo mật, không gửi về client
+                delete folder.protection.imageHash;
+            }
+            return folder;
         });
-        res.json(folders);
+
+        res.json(sanitizedFolders);
     } catch (error) {
+        console.error(error);
         res.status(500).json({ message: "Lỗi khi lấy danh sách thư mục." });
     }
 };
@@ -116,8 +112,6 @@ exports.moveFolder = async (req, res) => {
             return res.status(400).json({ message: "Không thể di chuyển thư mục vào chính nó." });
         }
 
-        // 2. Lấy toàn bộ danh sách ID con cháu của thư mục hiện tại
-        // Sử dụng hàm getAllSubFolderIds bạn đã viết ở trên
         const allSubFolderIds = await getAllSubFolderIds(id, userId);
 
         // 3. Kiểm tra: Nếu newParentId nằm trong danh sách con cháu -> Lỗi logic
@@ -214,5 +208,77 @@ exports.searchAll = async (req, res) => {
         res.json({ folders, files });
     } catch (error) {
         res.status(500).json({ message: "Lỗi tìm kiếm." });
+    }
+};
+
+exports.lockFolders = async (req, res) => {
+    try {
+        const { folderIds, imageHash } = req.body; 
+        const userId = req.user._id;
+
+        if (!folderIds || !Array.isArray(folderIds) || folderIds.length === 0) {
+            return res.status(400).json({ message: "Vui lòng chọn ít nhất một thư mục." });
+        }
+
+        const secret = process.env.FOLDER_LOCK_SECRET || 'laogia';
+
+        for (const id of folderIds) {
+            const folder = await Folder.findOne({ _id: id, userId });
+            if (!folder) continue;
+
+            let updateData = { 
+                'protection.status': 'locked',
+                'protection.updatedAt': new Date() 
+            };
+
+            if (imageHash) {
+                // Trường hợp 1: Có gửi ảnh mới (Khóa mới hoặc Cập nhật ảnh)
+                const finalHash = crypto.createHmac('sha256', secret).update(imageHash).digest('hex');
+                updateData['protection.imageHash'] = finalHash;
+            } else {
+                // Trường hợp 2: Không gửi ảnh (Chỉ muốn khóa lại bằng ảnh cũ)
+                // Kiểm tra xem thực sự trong DB đã tồn tại hash chưa
+                if (!folder.protection || !folder.protection.imageHash) {
+                    // Nếu chưa từng có ảnh mà lại để trống -> Lỗi
+                    return res.status(400).json({ 
+                        message: `Thư mục "${folder.name}" cần ảnh khóa cho lần thiết lập đầu tiên.` 
+                    });
+                }
+                // Nếu đã có hash rồi thì không cần ghi đè protection.imageHash, 
+                // updateData chỉ cần giữ status: 'locked' là đủ.
+            }
+
+            await Folder.updateOne({ _id: id }, { $set: updateData });
+        }
+
+        res.json({ message: "Cập nhật trạng thái khóa thành công." });
+    } catch (error) {
+        console.error("Lock error:", error);
+        res.status(500).json({ message: "Lỗi hệ thống khi thiết lập khóa." });
+    }
+};
+
+exports.unlockFolder = async (req, res) => {
+    try {
+        const { folderId, imageHash } = req.body;
+        const userId = req.user._id;
+
+        const folder = await Folder.findOne({ _id: folderId, userId });
+        if (!folder) return res.status(404).json({ message: "Thư mục không tồn tại." });
+
+        const secret = process.env.FOLDER_LOCK_SECRET || 'laoho';
+        const incomingHash = crypto.createHmac('sha256', secret).update(imageHash).digest('hex');
+
+        if (incomingHash !== folder.protection.imageHash) {
+            return res.status(403).json({ message: "Ảnh chìa khóa không chính xác." });
+        }
+
+        // CHỈ cập nhật status, GIỮ NGUYÊN imageHash
+        folder.protection.status = 'unlocked';
+        await folder.save();
+
+        res.json({ message: "Mở khóa thành công." });
+    } catch (error) {
+        res.status(500).json({ message: "Lỗi hệ thống khi mở khóa." });
     }
 };

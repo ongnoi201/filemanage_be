@@ -170,14 +170,43 @@ exports.moveFiles = async (req, res) => {
 
 exports.getFiles = async (req, res) => {
     try {
-        const folderId = req.query.folderId || null;
-        const files = await File.find({
+        // Lấy đúng logic xử lý folderId từ code cũ của bạn
+        let folderId = req.query.folderId || null;
+        // Fix lỗi nếu FE gửi chuỗi "null"
+        if (folderId === 'null') folderId = null;
+
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = (page - 1) * limit;
+
+        // Giữ nguyên Object Query như code cũ vì nó đang hoạt động tốt
+        const query = {
             userId: req.user._id,
             folderId: folderId,
             isDeleted: false
+        };        
+
+        // Thực hiện query có phân trang
+        const [files, totalItems] = await Promise.all([
+            File.find(query)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit),
+            File.countDocuments(query)
+        ]);        
+
+        // Trả về cấu trúc có kèm phân trang
+        res.json({
+            files,
+            pagination: {
+                totalItems,
+                totalPages: Math.ceil(totalItems / limit),
+                currentPage: page,
+                itemsPerPage: limit
+            }
         });
-        res.json(files);
     } catch (error) {
+        console.error("Lỗi getFiles:", error);
         res.status(500).json({ message: "Lỗi khi lấy danh sách file." });
     }
 };
@@ -187,15 +216,51 @@ exports.getRecentFiles = async (req, res) => {
     try {
         const userId = req.user._id;
 
+        // 1. Tìm tất cả các folder bị khóa TRỰC TIẾP
+        const directlyLockedFolders = await Folder.find({
+            userId: userId,
+            'protection.status': 'locked'
+        }).select('_id');
+
+        if (directlyLockedFolders.length === 0) {
+            // Nếu không có folder nào bị khóa, lấy 30 ảnh bình thường
+            const recentPhotos = await File.find({
+                userId: userId,
+                mimeType: { $regex: /^image\// },
+                isDeleted: false
+            }).sort({ createdAt: -1 }).limit(30);
+            return res.json(recentPhotos);
+        }
+
+        // 2. Thuật toán tìm tất cả folder con của các folder bị khóa
+        let allLockedFolderIds = directlyLockedFolders.map(f => f._id);
+        let searchIds = [...allLockedFolderIds];
+
+        // Lặp để tìm các cấp con (Deep Search)
+        while (searchIds.length > 0) {
+            const subFolders = await Folder.find({
+                userId: userId,
+                parentId: { $in: searchIds } // Giả sử bạn dùng trường parentId để lưu cha
+            }).select('_id');
+
+            if (subFolders.length > 0) {
+                const subIds = subFolders.map(f => f._id);
+                allLockedFolderIds.push(...subIds);
+                searchIds = subIds; // Tiếp tục tìm con của các con này
+            } else {
+                searchIds = [];
+            }
+        }
+
+        // 3. Lấy 30 ảnh mới nhất, loại trừ tất cả file thuộc nhánh bị khóa
         const recentPhotos = await File.find({
             userId: userId,
-            // Sử dụng Regex để lọc các file có mimeType là image (image/jpeg, image/png, etc.)
             mimeType: { $regex: /^image\// },
-            // Đảm bảo file chưa bị xóa (nếu bạn có dùng soft delete)
-            // isDeleted: false 
+            isDeleted: false,
+            folderId: { $nin: allLockedFolderIds } 
         })
-        .sort({ createdAt: -1 }) // Mới nhất lên đầu
-        .limit(30); // Giới hạn 30 mục
+        .sort({ createdAt: -1 })
+        .limit(30);
 
         res.json(recentPhotos);
     } catch (error) {

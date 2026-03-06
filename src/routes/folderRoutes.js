@@ -15,4 +15,7 @@ router.patch('/:id/rename', folderController.renameFolder); // Đổi tên
 router.patch('/:id/move', folderController.moveFolder); // Di chuyển
 router.delete('/:id', folderController.deleteFolder); // Xóa (soft delete)
 
+router.post('/lock-multiple', folderController.lockFolders);
+router.post('/unlock', folderController.unlockFolder);
+
 module.exports = router;
