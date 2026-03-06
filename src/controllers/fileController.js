@@ -39,9 +39,9 @@ exports.uploadFiles = async (req, res) => {
 
     } catch (error) {
         console.error('Chi tiết lỗi upload:', error); // In ra console để debug
-        res.status(500).json({ 
-            message: "Lỗi server khi upload file", 
-            error: error.message 
+        res.status(500).json({
+            message: "Lỗi server khi upload file",
+            error: error.message
         });
     }
 };
@@ -61,9 +61,31 @@ exports.renameFile = async (req, res) => {
     }
 };
 
+const getChildItems = async (folderId, userId) => {
+    let allFiles = [];
+    let allFolders = [folderId];
+
+    // 1. Tìm tất cả file trực tiếp trong thư mục này
+    const files = await File.find({ folderId, userId });
+    allFiles.push(...files);
+
+    // 2. Tìm các thư mục con trực tiếp
+    // Lưu ý: Đảm bảo field trong Model Folder của bạn là 'parentId' hoặc 'folderId'
+    const subFolders = await Folder.find({ parentId: folderId, userId });
+
+    // 3. Đệ quy để quét các thư mục con đó
+    for (const subFolder of subFolders) {
+        const { files: childFiles, folders: childFolders } = await getChildItems(subFolder._id, userId);
+        allFiles.push(...childFiles);
+        allFolders.push(...childFolders);
+    }
+
+    return { files: allFiles, folders: allFolders };
+};
+
 exports.deleteItems = async (req, res) => {
     try {
-        const { ids } = req.body; // ids là mảng chứa các ID của File hoặc Folder cần xóa
+        const { ids } = req.body;
         if (!ids || !Array.isArray(ids) || ids.length === 0) {
             return res.status(400).json({ message: "Danh sách ID không hợp lệ." });
         }
@@ -71,54 +93,59 @@ exports.deleteItems = async (req, res) => {
         const userId = req.user._id;
         let totalSizeReducted = 0;
         let cloudinaryIdsToDelete = [];
-        let allFileIdsToDelete = [];
-        let allFolderIdsToDelete = [];
+        let allFileIdsToDelete = new Set(); // Dùng Set để tránh trùng lặp ID
+        let allFolderIdsToDelete = new Set();
 
-        // 1. Phân loại và lấy thông tin
         for (const id of ids) {
-            // Kiểm tra xem ID này là Folder hay File
+            // Kiểm tra xem ID là Folder hay File
             const folder = await Folder.findOne({ _id: id, userId });
 
             if (folder) {
-                // Nếu là Folder: Tìm tất cả file bên trong (bao gồm cả thư mục con nếu có cấu trúc đệ quy)
-                // Lưu ý: Nếu bạn có nhiều cấp thư mục, cần tìm tất cả file có folderId nằm trong cây thư mục này
-                const filesInFolder = await File.find({ folderId: id, userId });
+                // Nếu là Folder: Lấy toàn bộ cây thư mục bên trong
+                const { files, folders } = await getChildItems(id, userId);
 
-                allFolderIdsToDelete.push(id);
-                filesInFolder.forEach(f => {
-                    allFileIdsToDelete.push(f._id);
-                    if (f.cloudinaryId) cloudinaryIdsToDelete.push(f.cloudinaryId);
-                    totalSizeReducted += f.size;
+                folders.forEach(fId => allFolderIdsToDelete.add(fId.toString()));
+                files.forEach(f => {
+                    allFileIdsToDelete.add(f._id.toString());
+                    if (f.cloudinaryId) cloudinaryIdsToDelete.add(f.cloudinaryId);
+                    totalSizeReducted += (f.size || 0);
                 });
             } else {
                 // Nếu là File: Kiểm tra trực tiếp
                 const file = await File.findOne({ _id: id, userId });
                 if (file) {
-                    allFileIdsToDelete.push(file._id);
+                    allFileIdsToDelete.add(file._id.toString());
                     if (file.cloudinaryId) cloudinaryIdsToDelete.push(file.cloudinaryId);
-                    totalSizeReducted += file.size;
+                    totalSizeReducted += (file.size || 0);
                 }
             }
         }
 
-        if (allFileIdsToDelete.length === 0 && allFolderIdsToDelete.length === 0) {
+        // Chuyển Set về Array để xử lý xóa
+        const finalFileIds = Array.from(allFileIdsToDelete);
+        const finalFolderIds = Array.from(allFolderIdsToDelete);
+
+        if (finalFileIds.length === 0 && finalFolderIds.length === 0) {
             return res.status(404).json({ message: "Không tìm thấy dữ liệu để xóa." });
         }
 
-        // 2. Xóa trên Cloudinary (nếu có file)
+        // --- BẮT ĐẦU QUÁ TRÌNH XÓA ---
+
+        // 1. Xóa trên Cloudinary
         if (cloudinaryIdsToDelete.length > 0) {
-            await deleteMultipleFromCloudinary(cloudinaryIdsToDelete);
+            // Chuyển Set sang Array nếu bạn dùng Set cho cloudinaryIds
+            await deleteMultipleFromCloudinary(Array.from(cloudinaryIdsToDelete));
         }
 
-        // 3. Xóa trong Database
-        if (allFileIdsToDelete.length > 0) {
-            await File.deleteMany({ _id: { $in: allFileIdsToDelete } });
+        // 2. Xóa trong Database
+        if (finalFileIds.length > 0) {
+            await File.deleteMany({ _id: { $in: finalFileIds } });
         }
-        if (allFolderIdsToDelete.length > 0) {
-            await Folder.deleteMany({ _id: { $in: allFolderIdsToDelete } });
+        if (finalFolderIds.length > 0) {
+            await Folder.deleteMany({ _id: { $in: finalFolderIds } });
         }
 
-        // 4. Cập nhật dung lượng User
+        // 3. Cập nhật dung lượng User
         if (totalSizeReducted > 0) {
             await User.findByIdAndUpdate(userId, {
                 $inc: { usedStorage: -totalSizeReducted }
@@ -126,8 +153,8 @@ exports.deleteItems = async (req, res) => {
         }
 
         res.json({
-            message: `Xóa thành công ${allFileIdsToDelete.length} file và ${allFolderIdsToDelete.length} thư mục.`,
-            details: { files: allFileIdsToDelete.length, folders: allFolderIdsToDelete.length }
+            message: `Xóa thành công ${finalFileIds.length} file và ${finalFolderIds.length} thư mục (bao gồm cả thư mục con).`,
+            details: { files: finalFileIds.length, folders: finalFolderIds.length }
         });
 
     } catch (error) {
@@ -184,7 +211,7 @@ exports.getFiles = async (req, res) => {
             userId: req.user._id,
             folderId: folderId,
             isDeleted: false
-        };        
+        };
 
         // Thực hiện query có phân trang
         const [files, totalItems] = await Promise.all([
@@ -193,7 +220,7 @@ exports.getFiles = async (req, res) => {
                 .skip(skip)
                 .limit(limit),
             File.countDocuments(query)
-        ]);        
+        ]);
 
         // Trả về cấu trúc có kèm phân trang
         res.json({
@@ -257,10 +284,10 @@ exports.getRecentFiles = async (req, res) => {
             userId: userId,
             mimeType: { $regex: /^image\// },
             isDeleted: false,
-            folderId: { $nin: allLockedFolderIds } 
+            folderId: { $nin: allLockedFolderIds }
         })
-        .sort({ createdAt: -1 })
-        .limit(30);
+            .sort({ createdAt: -1 })
+            .limit(30);
 
         res.json(recentPhotos);
     } catch (error) {
